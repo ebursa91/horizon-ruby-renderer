@@ -109,6 +109,7 @@ class HorizonScenarioTest < Minitest::Test
       assert_includes result.html, '$244.00 USD'
       assert_equal locale, result.manifest.fetch('locale')
       assert_equal fixture.dig('pages', 'product', 'request_id'), result.manifest.fetch('request_id')
+      assert_equal fixture.dig('pages', 'product', 'request_id').to_s, result.request.instance_variable_get(:@globals).dig('request', 'id')
     end
   end
 

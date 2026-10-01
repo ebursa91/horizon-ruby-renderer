@@ -32,6 +32,22 @@ class HorizonFixtureRendererTest < Minitest::Test
     assert_includes host.rendered_sources, 'snippets/button.liquid'
   end
 
+  def test_authoritative_configuration_does_not_read_local_saved_settings
+    @fixture.fetch('theme')['configuration_source'] = 'service'
+    definitions = JSON.parse(File.read(File.join(@theme, 'config/settings_schema.json')), allow_comments: true).flat_map { |group| group.fetch('settings', []) }
+    definitions.select { |setting| setting['type'] == 'font_picker' }.each do |setting|
+      @fixture.fetch('theme').fetch('settings')[setting.fetch('id')] = 'inter_n4'
+    end
+    host = renderer
+    source = host.send(:source)
+    original = source.method(:json)
+    source.define_singleton_method(:json) do |path|
+      raise 'authoritative renderer read local saved configuration' if path == 'config/settings_data.json'
+      original.call(path)
+    end
+    assert_includes host.render_result(scope: 'hero').html, 'Equip your everyday adventure'
+  end
+
   def test_real_product_list_uses_shared_store_products_and_prices
     result = renderer.render(scope: 'template')
     @fixture.fetch('globals').fetch('all_products').each_value do |product|

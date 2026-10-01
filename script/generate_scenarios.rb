@@ -95,6 +95,7 @@ module HorizonScenarios
     end
     value['item_count'] = quantities.sum
     value['total_price'] = value['original_total_price'] = value['items_subtotal_price'] = value.fetch('items').sum { |line| line.fetch('final_line_price') }
+    value['checkout_charge_amount'] = value.fetch('total_price')
     value['total_weight'] = value.fetch('items').sum { |line| line.fetch('variant').fetch('weight') * line.fetch('quantity') }
     value['token'] = "synthetic-#{Digest::SHA256.hexdigest(scenario_id)[0, 24]}"
     value
@@ -111,6 +112,7 @@ module HorizonScenarios
     (5..size).each { |index| products << cloned_product(originals.fetch((index - 1) % 4), index) }
     chosen_product = products.last
     globals = fixture.fetch('globals')
+    globals.fetch('shop')['products_count'] = size
     globals['all_products'] = products.to_h { |product| [product.fetch('handle'), copy(product)] }
     globals['products'] = copy(products)
     globals['collections'] = base.fetch('globals').fetch('collections').to_h do |handle, old_collection|

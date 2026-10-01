@@ -20,6 +20,7 @@ module HorizonScenarioValidation
     require_condition(%w[default wide].include?(configuration), 'scenario configuration must be default/wide')
     products = globals.fetch('all_products').values
     require_condition(products.length == size && globals.fetch('products').length == size, 'catalog product counts disagree')
+    require_condition(globals.dig('shop', 'products_count') == size, 'shop product count must match canonical catalog')
     product_ids, variant_ids, image_ids, option_ids = [], [], [], []
     products.each do |product|
       product_ids << product.fetch('id')
@@ -70,6 +71,9 @@ module HorizonScenarioValidation
       expected
     end
     require_condition(%w[total_price original_total_price items_subtotal_price].all? { |key| cart.fetch(key) == total }, 'cart total prices mismatch')
+    require_condition(cart.fetch('checkout_charge_amount') == total, 'cart without selling plans must charge the declared total')
+    expected_weight = cart.fetch('items').sum { |line| line.fetch('variant').fetch('weight') * line.fetch('quantity') }
+    require_condition(cart.fetch('total_weight') == expected_weight, 'cart total weight mismatch')
     require_condition(total == (configuration == 'wide' ? 24_400 : 13_100), 'cart total must match declared scenario configuration')
     expected_width = configuration == 'wide' ? 'wide' : 'narrow'
     require_condition(fixture.dig('theme', 'settings', 'page_width') == expected_width, 'page width must match scenario configuration')
@@ -93,6 +97,11 @@ module HorizonScenarioValidation
       elsif type == 'collection'
         collection = globals.fetch('collections').fetch(resource.fetch('handle'))
         page_size = fixture.dig('theme', 'page_overrides', page_key, 'section_overrides', 'main', 'settings', 'products_per_page')
+        expected_page_size = configuration == 'wide' ? 12 : 24
+        require_condition(page_size == expected_page_size, 'collection page size must match scenario configuration')
+        expected_grid_width = configuration == 'wide' ? 'full-width' : 'centered'
+        require_condition(fixture.dig('theme', 'page_overrides', page_key, 'section_overrides', 'main', 'settings', 'product_grid_width') == expected_grid_width, 'collection grid width mismatch')
+        require_condition(fixture.dig('theme', 'page_overrides', page_key, 'section_overrides', 'main', 'settings', 'enable_infinite_scroll') == false, 'scenario must use genuine selected-page pagination')
         pages = [(collection.fetch('products_count').to_f / page_size).ceil, 1].max
         require_condition((1..pages).cover?(page.fetch('current_page', 1)), 'collection page outside pagination range')
       else raise ArgumentError, "unsupported page type #{type}"

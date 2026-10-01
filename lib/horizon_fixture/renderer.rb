@@ -580,6 +580,7 @@ module HorizonFixture
       page_data = fixture.fetch('pages').fetch(page)
       @page, @page_type = page, page_data.fetch('type', page)
       @page_overrides = fixture.dig('theme', 'page_overrides', page) || {}
+      @globals.fetch('request')['id'] = page_data.fetch('request_id').to_s if page_data.key?('request_id')
       @globals.merge!('page_title' => page_data.fetch('title'), 'page_description' => page_data.fetch('description'), 'canonical_url' => page_data.fetch('canonical_url', @globals.fetch('canonical_url', page_data.fetch('url'))), 'current_page' => page_data.fetch('current_page', @globals.fetch('current_page', 1)), 'current_tags' => @globals.fetch('current_tags', []))
       @globals['template'] = TemplateName.new(@page_type)
       if page_data.key?('type')
@@ -743,7 +744,8 @@ module HorizonFixture
     def global_settings
       schema = @source.json('config/settings_schema.json').flat_map { |group| group.fetch('settings', []) }
       defaults = setting_defaults(schema)
-      configured = defaults.merge(@source.json('config/settings_data.json').fetch('current')).merge(fixture.fetch('theme').fetch('settings', {}))
+      saved = fixture.dig('theme', 'configuration_source') == 'service' ? {} : @source.json('config/settings_data.json').fetch('current')
+      configured = defaults.merge(saved).merge(fixture.fetch('theme').fetch('settings', {}))
       materialize_settings(configured, schema, @globals)
     end
 

@@ -1,6 +1,6 @@
 # Horizon Ruby renderer
 
-Render one entirely synthetic store with pinned Shopify Liquid and unmodified external Horizon sources. This is an original fixture host with bounded Shopify platform adapters, a CLI and a reusable Ruby library.
+Render entirely synthetic stores with pinned Shopify Liquid and unmodified external Horizon sources. Store and saved configuration can come from a tenant-aware native gRPC data authority. This original fixture host includes bounded Shopify platform adapters, a CLI and a reusable Ruby library.
 
 Ruby >= 3.4 is required. The default is Ruby 4.0.7; the reference extraction also runs on Ruby 3.4.10. The external pins are Liquid 5.14.0 (`4e39ae4cc3da73921923c0669e0fc84a66b2f696`) and Horizon 4.2.0 (`5acd1b6b66c02f61d3216e3adace5dd9e0404fc9`). No upstream Liquid or Horizon source is included.
 
@@ -8,13 +8,25 @@ Ruby >= 3.4 is required. The default is Ruby 4.0.7; the reference extraction als
 
 Provide clean external checkouts at those commits and install dependencies using `bundle install`. The CLI verifies HEAD, tracked cleanliness and the actual loaded Liquid source.
 
+Use the private mock data authority for native RPC rendering. The service supplies every store/cart/configuration snapshot; the client validates scope and exact context bytes before rendering, with no local file fallback. See [the data-service contract and native client API](docs/DATA_SERVICE.md).
+
+```sh
+HORIZON_DATA_TOKEN=mock-tenant-a-token bundle exec bin/horizon-render \
+  --liquid-root /absolute/pinned-liquid --theme-root /absolute/pinned-horizon \
+  --grpc-endpoint 127.0.0.1:50051 --tenant-id demo-a --storefront-id large \
+  --locale pl --configuration wide --cart-id default --request-id request-0001 \
+  --page collection --current-page 2 --output-dir /tmp/horizon-rpc-page
+```
+
+The explicit local fixture mode retains the independently recorded offline oracle and engine benchmark:
+
 ```sh
 bundle exec ruby bin/horizon-render --liquid-root /absolute/pinned-liquid --theme-root /absolute/pinned-horizon --fixture fixtures/store.json --scope page --output-dir /tmp/horizon-ruby-page
 LIQUID_RUBY_ROOT=/absolute/pinned-liquid HORIZON_THEME_ROOT=/absolute/pinned-horizon bundle exec ruby test/renderer_test.rb
 python3 script/validate_fixture.py
 ```
 
-Generated HTML and CSS must stay outside the repository. Synthetic product assets live in `fixtures/mock-assets`; theme assets remain in the external checkout. No Shopify account, credential, network API or merchant/customer data is used. Read [the fixture contract](docs/FIXTURE.md) for field provenance and limitations.
+Generated HTML and CSS must stay outside the repository. Synthetic product assets live in `fixtures/mock-assets`; theme assets remain in the external checkout. No Shopify account or merchant/customer data is used. Read [the fixture contract](docs/FIXTURE.md) and [genuine product/collection scenario coverage](docs/SCENARIOS.md) for provenance and limitations.
 
 For a local preview after a successful render, link the external theme assets and copy the original synthetic product assets into the output directory, then serve it on localhost:
 

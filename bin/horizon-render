@@ -6,7 +6,7 @@ require 'json'
 require 'optparse'
 require_relative '../lib/horizon_fixture/runtime'
 
-options = { page: 'index', scope: 'page', mode: 'direct' }
+options = { page: 'index', scope: 'page', mode: 'direct', locale: 'en', configuration: 'published', current_page: 1, cart_id: 'default', deadline_seconds: 5.0 }
 OptionParser.new do |parser|
   parser.banner = 'Usage: horizon-render --liquid-root PATH --theme-root PATH --fixture PATH [--scope hero|template|page] [--mode direct|fiber] [--output-dir PATH]'
   parser.on('--liquid-root PATH') { |value| options[:liquid_root] = value }
@@ -14,13 +14,22 @@ OptionParser.new do |parser|
   parser.on('--theme PATH') { |value| options[:theme_root] = value }
   parser.on('--fixture PATH') { |value| options[:fixture] = value }
   parser.on('--store PATH') { |value| options[:fixture] = value }
+  parser.on('--grpc-endpoint HOST:PORT') { |value| options[:grpc_endpoint] = value }
+  parser.on('--tenant-id ID') { |value| options[:tenant_id] = value }
+  parser.on('--storefront-id ID') { |value| options[:storefront_id] = value }
+  parser.on('--cart-id ID') { |value| options[:cart_id] = value }
+  parser.on('--request-id ID') { |value| options[:request_id] = value }
+  parser.on('--locale ISO') { |value| options[:locale] = value }
+  parser.on('--configuration NAME') { |value| options[:configuration] = value }
+  parser.on('--current-page N', Integer) { |value| options[:current_page] = value }
+  parser.on('--deadline-seconds N', Float) { |value| options[:deadline_seconds] = value }
   parser.on('--page NAME') { |value| options[:page] = value }
   parser.on('--scope SCOPE') { |value| options[:scope] = value }
   parser.on('--only TYPE') { |value| options[:scope] = value }
   parser.on('--mode MODE') { |value| options[:mode] = value }
   parser.on('--output-dir PATH') { |value| options[:output_dir] = value }
 end.parse!
-%i[liquid_root theme_root fixture].each { |key| abort "missing --#{key.to_s.tr('_', '-')}" unless options[key] }
+%i[liquid_root theme_root].each { |key| abort "missing --#{key.to_s.tr('_', '-')}" unless options[key] }
 
 begin
   roots = [options[:liquid_root], options[:theme_root]]
@@ -28,12 +37,25 @@ begin
     options[:output_dir] = HorizonFixture::Runtime.external_output_path!(options[:output_dir], roots: roots)
     artifact_paths = %w[index.html styles.css report.json].map { |name| File.join(options[:output_dir], name) }
     artifact_paths.each { |path| HorizonFixture::Runtime.artifact_path!(path, roots: roots) }
-    HorizonFixture::Runtime.reject_input_collisions!(options[:fixture], artifact_paths, roots: roots)
+    HorizonFixture::Runtime.reject_input_collisions!(options[:fixture], artifact_paths, roots: roots) if options[:fixture]
     HorizonFixture::Runtime.clear_success_markers!([File.join(options[:output_dir], 'report.json')], roots: roots)
   end
   liquid_source = HorizonFixture::Runtime.load_liquid!(options[:liquid_root])
   HorizonFixture::Runtime.verify_checkout(options[:theme_root], HorizonFixture::THEME_SHA, 'theme')
-  fixture = JSON.parse(File.read(options[:fixture]))
+  if options[:grpc_endpoint]
+    raise ArgumentError, '--fixture/--store cannot be combined with native RPC mode' if options[:fixture]
+    %i[tenant_id storefront_id request_id].each { |key| raise ArgumentError, "missing --#{key.to_s.tr('_', '-')}" unless options[key] }
+    require_relative '../lib/horizon_fixture/data_client'
+    snapshot = HorizonFixture::DataClient.new(endpoint: options[:grpc_endpoint], token: ENV.fetch('HORIZON_DATA_TOKEN') { raise ArgumentError, 'missing HORIZON_DATA_TOKEN' }, deadline_seconds: options[:deadline_seconds]).fetch(
+      tenant_id: options[:tenant_id], storefront_id: options[:storefront_id], request_id: options[:request_id], locale: options[:locale],
+      configuration: options[:configuration], page: options[:page], current_page: options[:current_page], cart_id: options[:cart_id])
+    fixture, fixture_sha, data_service = snapshot.fixture, snapshot.metadata.fetch('context_sha256'), snapshot.metadata
+  else
+    raise ArgumentError, 'use --grpc-endpoint for authoritative data, or explicit --fixture for offline baseline' unless options[:fixture]
+    fixture = JSON.parse(File.read(options[:fixture]))
+    fixture_sha = Digest::SHA256.file(options[:fixture]).hexdigest
+    data_service = { 'transport' => 'offline fixture', 'authoritative_rpc' => false }
+  end
   raise ArgumentError, 'fixture theme SHA does not match pin' unless fixture.dig('theme', 'sha') == HorizonFixture::THEME_SHA
   renderer = HorizonFixture::Renderer.new(theme_root: options[:theme_root], fixture: fixture)
   result = HorizonFixture::Runtime.execute(options[:mode]) { renderer.render_result(page: options[:page], scope: options[:scope]) }
@@ -41,7 +63,7 @@ begin
   if options[:output_dir]
     manifest = result.manifest.merge(HorizonFixture::Runtime.metadata).merge(HorizonFixture::Runtime.output_digest(result)).merge(
       'scope' => options[:scope], 'page' => options[:page], 'response_cache' => false,
-      'fixture_sha256' => Digest::SHA256.file(options[:fixture]).hexdigest,
+      'fixture_sha256' => fixture_sha, 'data_service' => data_service,
       'html_sha256' => Digest::SHA256.hexdigest(html), 'liquid_root' => File.realpath(options[:liquid_root]),
       'liquid_sha' => HorizonFixture::LIQUID_SHA, 'liquid_source' => liquid_source,
       'execution_mode' => options[:mode], 'schema_version' => 1,
@@ -55,7 +77,7 @@ begin
   else
     print html
   end
-rescue ArgumentError, LoadError, HorizonFixture::ContractError => error
+rescue StandardError, LoadError => error
   warn error.message
   exit 1
 end
