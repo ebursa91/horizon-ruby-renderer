@@ -9,30 +9,61 @@ Ruby >= 3.4 is required. The default is Ruby 4.0.7; the reference extraction als
 Provide clean external checkouts at those commits and install dependencies using `bundle install`. The CLI verifies HEAD, tracked cleanliness and the actual loaded Liquid source.
 
 ```sh
-ruby bin/horizon-render --liquid-root /absolute/pinned-liquid --theme-root /absolute/pinned-horizon --fixture fixtures/store.json --scope page --output-dir /tmp/horizon-ruby-page
-LIQUID_RUBY_ROOT=/absolute/pinned-liquid HORIZON_THEME_ROOT=/absolute/pinned-horizon ruby test/renderer_test.rb
+bundle exec ruby bin/horizon-render --liquid-root /absolute/pinned-liquid --theme-root /absolute/pinned-horizon --fixture fixtures/store.json --scope page --output-dir /tmp/horizon-ruby-page
+LIQUID_RUBY_ROOT=/absolute/pinned-liquid HORIZON_THEME_ROOT=/absolute/pinned-horizon bundle exec ruby test/renderer_test.rb
 python3 script/validate_fixture.py
 ```
 
 Generated HTML and CSS must stay outside the repository. Synthetic product assets live in `fixtures/mock-assets`; theme assets remain in the external checkout. No Shopify account, credential, network API or merchant/customer data is used. Read [the fixture contract](docs/FIXTURE.md) for field provenance and limitations.
 
+For a local preview after a successful render, link the external theme assets and copy the original synthetic product assets into the output directory, then serve it on localhost:
+
+```sh
+ln -s /absolute/pinned-horizon/assets /tmp/horizon-ruby-page/assets
+cp -R fixtures/mock-assets/cdn /tmp/horizon-ruby-page/cdn
+python3 -m http.server 8765 --bind 127.0.0.1 --directory /tmp/horizon-ruby-page
+```
+
+Open `http://127.0.0.1:8765/index.html`. Asset setup and the local server are outside the benchmark workload.
+
 The expected homepage is 435304 HTML bytes, SHA256 `d97c35b3ba08f026536cb4c469623acb9957af59fb9a9171db012958515fe990`, and 279112 collected CSS bytes, SHA256 `67a6538e0b763c32ced001728ebf68f375dec497d4fb91c0ee136658ff9f2034`. Parser mode is strict, filters are strict, rendering uses `render!`, optional variables resolve to nil. Unsupported executed platform behavior fails.
 
 ## Library
 
-Load the pinned Liquid checkout before requiring the library, then reuse one renderer for sequential requests:
+Load the pinned Liquid checkout before requiring the library, then reuse one renderer:
 
 ```ruby
 $LOAD_PATH.unshift('/absolute/pinned-liquid/lib')
 require_relative 'lib/horizon_fixture'
 fixture = JSON.parse(File.read('fixtures/store.json'))
 renderer = HorizonFixture::Renderer.new(theme_root: '/absolute/pinned-horizon', fixture: fixture)
-html = renderer.render(scope: 'page')
-css = renderer.stylesheets.values.join
+response = renderer.render_result(scope: 'page')
+html, css = response.html, response.css
+# Optional per-request synthetic globals override the persisted fixture.
+response = renderer.render_result(scope: 'hero', globals: { 'request_marker' => 'second' })
 ```
 
-Rendering reuses parsed templates but resets request globals, diagnostics and stylesheet collection. Initialization and warm render measurements, YJIT and fiber evaluation will be documented separately. Fibers do not make CPU-bound Liquid work parallel.
+The renderer owns an immutable fixture snapshot and caches immutable source text, parsed JSON/schema data and Liquid ASTs. Every render builds fresh globals, Drops, settings, contexts, diagnostics, stylesheets and mutable Liquid Template wrappers. It never caches a rendered response. `render_result` returns the HTML, assembled CSS and diagnostics belonging to that request. `render(scope: 'page')` still returns just the HTML; the renderer's diagnostic readers refer to its current Fiber or latest completed request.
+
+Cooperative Fibers may share one renderer on one Ruby thread; request results stay isolated when rendering is suspended and resumed. Parallel thread rendering is not supported. Run a single request in a Fiber with `--mode fiber` or `HorizonFixture::Runtime.execute('fiber') { renderer.render_result(scope: 'page') }`. Fibers provide a hosting boundary and do not parallelize CPU-bound Liquid work. No scheduler or async dependency is needed for this synchronous workload.
+
+## Measure
+
+Enable YJIT explicitly on modern CRuby, rather than treating it as an implied default:
+
+```sh
+bundle exec ruby --yjit bin/horizon-render --liquid-root /absolute/pinned-liquid --theme-root /absolute/pinned-horizon --fixture fixtures/store.json --scope page --mode fiber --output-dir /tmp/horizon-ruby-yjit
+bundle exec ruby --yjit benchmark/worker.rb --liquid-root /absolute/pinned-liquid --theme-root /absolute/pinned-horizon --fixture fixtures/store.json --scope page --benchmark-mode direct --warmup 50 --iterations 25 --output-dir /tmp/horizon-ruby-benchmark
+```
+
+The worker writes `report.json`, `index.html` and `styles.css` outside all source roots. `--benchmark-json /tmp/report.json` also writes the same JSON at a chosen external path. Constructor initialization and the first render, which includes lazy parsing, are reported separately. `--warmup N` counts all excluded requests, including that first render, and must be positive. Warm samples reuse prepared source/ASTs and measure fresh request rendering plus HTML and CSS assembly. SHA256, output writes, provenance checks and report construction occur outside those samples. Every warmup and measured result must match the first render; compare the reported digests with the independent pinned digests above before accepting a timing. GC remains enabled.
+
+Reports include per-sample wall time, process CPU time and allocated objects, peak process RSS when Linux exposes it, actual Ruby/YJIT/dependency versions, source provenance, scope and `response_cache: false`. Compare plain Ruby, YJIT direct and YJIT Fiber in separate fresh processes with the same runtime, dependencies, fixture, scope and warmup. Host contention, JIT warmup, GC and execution order affect results; one synthetic page is not a general Ruby or Shopify benchmark. Cold CLI timing includes process startup and checkout validation.
+
+An allocation profile of the original host found 88 JSON parses and 41 schema parses per warm homepage, plus context-local snippet parsing. Immutable source/JSON/schema and cross-request AST caches remove that repeated preparation; dynamic setting bindings and output still execute on every request. See [the measurement notes](docs/PERFORMANCE.md).
 
 ## Scope and license
 
 This fixture covers one homepage configuration and locale, not a Shopify server. Checkout, form submission, external services and full Drop semantics are unsupported. Payment terms return empty only for the fixture's explicit disabled capability. Liquid and Horizon remain independently licensed external dependencies; review Horizon's license before distributing its sources or generated content. This repository contains original host/fixture code and synthetic SVGs under the MIT license. Host extraction provenance: `ebursa91/liquid-rust` commit `ce6f371439aa556426c469c319f04afec77aad57`.
+
+Next work should add real pinned product and collection templates with original synthetic fixtures, broaden executed platform contracts with strict tests, and profile further preparation/rendering costs. External theme sources and generated output remain local dependencies rather than repository artifacts.

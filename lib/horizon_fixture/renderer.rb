@@ -129,17 +129,42 @@ module HorizonFixture
     def to_s = @value
   end
 
+  # Source caches contain only immutable JSON/text; runtime Drops stay request-local.
+  module JSONTree
+    module_function
+
+    def copy(value)
+      case value
+      when Hash then value.transform_values { |item| copy(item) }
+      when Array then value.map { |item| copy(item) }
+      when String then value.dup
+      when Numeric, NilClass, TrueClass, FalseClass then value
+      else raise ContractError, "expected JSON value, found #{value.class}"
+      end
+    end
+
+    def freeze(value)
+      case value
+      when Hash then value.each { |key, item| key.freeze; freeze(item) }
+      when Array then value.each { |item| freeze(item) }
+      end
+      value.freeze
+    end
+  end
+
   class Source
     def initialize(root)
       @root = Pathname(root).realpath
+      @text, @json, @schemas = {}, {}, {}
     end
 
     def read(path)
+      return @text.fetch(path) if @text.key?(path)
       candidate = @root.join(path).realpath
       unless candidate.to_s.start_with?("#{@root}/") && candidate.file?
         raise ContractError, "theme path escapes checkout: #{path}"
       end
-      candidate.read
+      @text[path] = candidate.read.freeze
     rescue Errno::ENOENT
       raise ContractError, "missing theme file #{path}"
     end
@@ -152,12 +177,13 @@ module HorizonFixture
     end
 
     def json(path)
-      JSON.parse(read(path), allow_comments: true)
+      @json[path] ||= JSONTree.freeze(JSON.parse(read(path), allow_comments: true))
     end
 
     def schema(path)
+      return @schemas.fetch(path) if @schemas.key?(path)
       match = read(path).match(/{%-?\s*schema\s*-?%}(.*?){%-?\s*endschema\s*-?%}/m)
-      match ? JSON.parse(match[1], allow_comments: true) : {}
+      @schemas[path] = JSONTree.freeze(match ? JSON.parse(match[1], allow_comments: true) : {})
     end
   end
 
@@ -459,33 +485,27 @@ module HorizonFixture
     def host = @context.registers[:horizon]
   end
 
-  class Renderer
+  class Request
     CSS_SENTINEL = '<!-- horizon-fixture-stylesheets -->'
     attr_reader :fixture, :stylesheets, :platform_filters, :rendered_sources
 
-    def initialize(theme_root:, fixture:)
-      @source = Source.new(theme_root)
-      @fixture = fixture
-      raise ContractError, 'expected synthetic fixture schema version 1' unless fixture['synthetic'] == true && fixture['schema_version'] == 1
-      @environment = Liquid::Environment.build(error_mode: :strict, file_system: @source) do |env|
-        env.register_filter(Filters)
-        env.register_tag('schema', SchemaTag)
-        env.register_tag('stylesheet', StylesheetTag)
-        env.register_tag('style', StyleTag)
-        env.register_tag('content_for', ContentForTag)
-        env.register_tag('sections', SectionsTag)
-        env.register_tag('paginate', PaginateTag)
-        env.register_tag('render', RenderTag)
-        env.register_tag('form', FormTag)
-      end
-      @cache = {}
+    def initialize(renderer)
+      @source = renderer.send(:source)
+      @fixture = renderer.fixture
+      @environment = renderer.send(:environment)
+      @cache = renderer.send(:templates)
+      # Each request owns Template wrappers, errors, registers and resource limits.
+      # Parsed nodes are shared; rendered values and mutable wrappers are never shared.
+      @partials = renderer.send(:partials).transform_values(&:dup)
       reset
     end
 
-    def render(page: 'index', scope: 'hero')
+    attr_reader :partials
+
+    def render(page: 'index', scope: 'hero', globals: {})
       reset
       raise ContractError, "unsupported scope #{scope.inspect}" unless %w[hero template page].include?(scope)
-      @globals = typed_globals(deep_copy(fixture.fetch('globals')))
+      @globals = typed_globals(fixture.fetch('globals').merge(globals))
       @globals.dig('cart', 'items')&.each_with_index { |item, index| item['index'] = index }
       page_data = fixture.fetch('pages').fetch(page)
       @globals.merge!('page_title' => page_data.fetch('title'), 'page_description' => page_data.fetch('description'), 'canonical_url' => @globals.fetch('canonical_url', page_data.fetch('url')), 'current_page' => @globals.fetch('current_page', 1), 'current_tags' => @globals.fetch('current_tags', []))
@@ -507,7 +527,8 @@ module HorizonFixture
     def render_path(path, globals, locals = {}, parent: nil)
       record_source(path)
       template = (@cache[path] ||= Liquid::Template.new(environment: @environment).parse(@source.read(path), error_mode: :strict, line_numbers: true))
-      context = Context.build(environment: @environment, static_environments: globals, outer_scope: locals, registers: { horizon: self, file_system: @source }, rethrow_errors: true, resource_limits: parent&.resource_limits)
+      template = template.dup
+      context = Context.build(environment: @environment, static_environments: globals, outer_scope: locals, registers: { horizon: self, file_system: @source, cached_partials: @partials, template_factory: TemplateFactory.new(@environment) }, rethrow_errors: true, resource_limits: parent&.resource_limits)
       context.template_name = path
       context.strict_filters = true
       context.strict_variables = false
@@ -588,7 +609,7 @@ module HorizonFixture
       @stylesheets, @platform_filters, @rendered_sources = {}, [], []
     end
 
-    def deep_copy(value) = Marshal.load(Marshal.dump(value))
+    def deep_copy(value) = JSONTree.copy(value)
 
     def typed_globals(value)
       case value
@@ -597,6 +618,7 @@ module HorizonFixture
         value.to_h do |key, item|
           [key, key == 'focal_point' && item.is_a?(Hash) ? FocalPoint.new(item) : typed_globals(item)]
         end
+      when String then value.dup
       else value
       end
     end
@@ -690,4 +712,77 @@ module HorizonFixture
       %(<#{tag} id="#{CGI.escapeHTML(id)}" class="#{CGI.escapeHTML(css_class)}">#{body}</#{tag}>)
     end
   end
+
+  class TemplateFactory < Liquid::TemplateFactory
+    def initialize(environment)
+      @environment = environment
+    end
+
+    def for(_name) = Liquid::Template.new(environment: @environment)
+  end
+
+  # The response belongs to one request, including when sibling Fibers interleave.
+  Result = Data.define(:html, :css, :request) do
+    def manifest = request.manifest
+    def stylesheets = request.stylesheets
+    def platform_filters = request.platform_filters
+    def rendered_sources = request.rendered_sources
+  end
+
+  class Renderer
+    CSS_SENTINEL = Request::CSS_SENTINEL
+    attr_reader :fixture
+
+    def initialize(theme_root:, fixture:)
+      raise ContractError, 'expected synthetic fixture schema version 1' unless fixture['synthetic'] == true && fixture['schema_version'] == 1
+      @fixture = JSONTree.freeze(JSONTree.copy(fixture))
+      @source = Source.new(theme_root)
+      @environment = Liquid::Environment.build(error_mode: :strict, file_system: @source) do |env|
+        env.register_filter(Filters)
+        env.register_tag('schema', SchemaTag)
+        env.register_tag('stylesheet', StylesheetTag)
+        env.register_tag('style', StyleTag)
+        env.register_tag('content_for', ContentForTag)
+        env.register_tag('sections', SectionsTag)
+        env.register_tag('paginate', PaginateTag)
+        env.register_tag('render', RenderTag)
+        env.register_tag('form', FormTag)
+      end
+      @templates, @partials = {}, {}
+      @requests = ObjectSpace::WeakKeyMap.new
+      @last_request = nil
+    end
+
+    def render(page: 'index', scope: 'hero', globals: {})
+      render_result(page: page, scope: scope, globals: globals).html
+    end
+
+    def render_result(page: 'index', scope: 'page', globals: {})
+      request = new_request
+      @requests[Fiber.current] = request
+      html = request.render(page: page, scope: scope, globals: globals)
+      css = request.stylesheets.values.join
+      @partials.merge!(request.partials) { |_key, cached, _new| cached }
+      request.stylesheets.freeze
+      request.platform_filters.freeze
+      request.rendered_sources.freeze
+      @last_request = request
+      Result.new(html: html.freeze, css: css.freeze, request: request)
+    rescue StandardError
+      request&.send(:reset)
+      raise
+    end
+
+    def stylesheets = current_request&.stylesheets || {}
+    def platform_filters = current_request&.platform_filters || []
+    def rendered_sources = current_request&.rendered_sources || []
+    def manifest = current_request ? current_request.manifest : new_request.manifest
+
+    private
+
+    attr_reader :source, :environment, :templates, :partials
+    def current_request = @requests[Fiber.current] || @last_request
+    def new_request = Request.new(self)
+  end
+
 end

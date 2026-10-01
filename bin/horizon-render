@@ -23,31 +23,34 @@ end.parse!
 %i[liquid_root theme_root fixture].each { |key| abort "missing --#{key.to_s.tr('_', '-')}" unless options[key] }
 
 begin
+  roots = [options[:liquid_root], options[:theme_root]]
   if options[:output_dir]
-    options[:output_dir] = HorizonFixture::Runtime.external_output_path!(options[:output_dir], roots: [options[:liquid_root], options[:theme_root]])
+    options[:output_dir] = HorizonFixture::Runtime.external_output_path!(options[:output_dir], roots: roots)
+    artifact_paths = %w[index.html styles.css report.json].map { |name| File.join(options[:output_dir], name) }
+    artifact_paths.each { |path| HorizonFixture::Runtime.artifact_path!(path, roots: roots) }
+    HorizonFixture::Runtime.reject_input_collisions!(options[:fixture], artifact_paths, roots: roots)
+    HorizonFixture::Runtime.clear_success_markers!([File.join(options[:output_dir], 'report.json')], roots: roots)
   end
   liquid_source = HorizonFixture::Runtime.load_liquid!(options[:liquid_root])
   HorizonFixture::Runtime.verify_checkout(options[:theme_root], HorizonFixture::THEME_SHA, 'theme')
   fixture = JSON.parse(File.read(options[:fixture]))
   raise ArgumentError, 'fixture theme SHA does not match pin' unless fixture.dig('theme', 'sha') == HorizonFixture::THEME_SHA
   renderer = HorizonFixture::Renderer.new(theme_root: options[:theme_root], fixture: fixture)
-  html = HorizonFixture::Runtime.execute(options[:mode]) { renderer.render(page: options[:page], scope: options[:scope]) }
-  css = renderer.stylesheets.values.join
+  result = HorizonFixture::Runtime.execute(options[:mode]) { renderer.render_result(page: options[:page], scope: options[:scope]) }
+  html, css = result.html, result.css
   if options[:output_dir]
-    manifest = renderer.manifest.merge(
-      'scope' => options[:scope], 'fixture_sha256' => Digest::SHA256.file(options[:fixture]).hexdigest,
+    manifest = result.manifest.merge(HorizonFixture::Runtime.metadata).merge(HorizonFixture::Runtime.output_digest(result)).merge(
+      'scope' => options[:scope], 'page' => options[:page], 'response_cache' => false,
+      'fixture_sha256' => Digest::SHA256.file(options[:fixture]).hexdigest,
       'html_sha256' => Digest::SHA256.hexdigest(html), 'liquid_root' => File.realpath(options[:liquid_root]),
       'liquid_sha' => HorizonFixture::LIQUID_SHA, 'liquid_source' => liquid_source,
-      'ruby_version' => RUBY_VERSION, 'ruby_description' => RUBY_DESCRIPTION,
-      'yjit_enabled' => defined?(RubyVM::YJIT) ? RubyVM::YJIT.enabled? : false,
       'execution_mode' => options[:mode], 'schema_version' => 1,
-      'html' => { 'bytes' => html.bytesize, 'sha256' => Digest::SHA256.hexdigest(html) },
-      'css' => { 'bytes' => css.bytesize, 'sha256' => Digest::SHA256.hexdigest(css) }
+      'correctness_verified' => false
     )
     FileUtils.mkdir_p(options[:output_dir])
-    File.write(File.join(options[:output_dir], 'index.html'), html)
-    File.write(File.join(options[:output_dir], 'styles.css'), css)
-    File.write(File.join(options[:output_dir], 'report.json'), JSON.pretty_generate(manifest) + "\n")
+    HorizonFixture::Runtime.write_artifact!(File.join(options[:output_dir], 'index.html'), html, roots: roots)
+    HorizonFixture::Runtime.write_artifact!(File.join(options[:output_dir], 'styles.css'), css, roots: roots)
+    HorizonFixture::Runtime.write_artifact!(File.join(options[:output_dir], 'report.json'), JSON.pretty_generate(manifest) + "\n", roots: roots)
     puts JSON.generate(manifest)
   else
     print html

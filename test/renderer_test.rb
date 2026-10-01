@@ -149,15 +149,111 @@ class HorizonFixtureRendererTest < Minitest::Test
   def test_local_settings_bindings_keep_theme_settings_visible
     host = renderer
     values = { 'local' => '{{ settings.theme_value }}', 'theme_value' => 'wrong' }
-    materialized = host.send(:materialize_settings, values, [], 'settings' => { 'theme_value' => 'theme' })
+    materialized = host.send(:new_request).send(:materialize_settings, values, [], 'settings' => { 'theme_value' => 'theme' })
     assert_equal 'theme', materialized.fetch('local')
-    initial = host.send(:materialize_settings, values, [], {})
+    initial = host.send(:new_request).send(:materialize_settings, values, [], {})
     assert_equal 'wrong', initial.fetch('local')
   end
 
   def test_source_rejects_snippet_path_traversal
     source = HorizonFixture::Source.new(@theme)
     assert_raises(HorizonFixture::ContractError) { source.read_template_file('../layout/theme') }
+  end
+
+  def test_source_caches_immutable_text_json_and_schemas
+    source = HorizonFixture::Source.new(@theme)
+    text = source.read('sections/hero.liquid')
+    json = source.json('templates/index.json')
+    schema = source.schema('sections/hero.liquid')
+    assert_same text, source.read('sections/hero.liquid')
+    assert_same json, source.json('templates/index.json')
+    assert_same schema, source.schema('sections/hero.liquid')
+    assert text.frozen?
+    assert json.fetch('sections').frozen?
+    assert schema.fetch('settings').first.frozen?
+    assert_raises(FrozenError) { json.fetch('order') << 'changed' }
+  end
+
+  def test_request_globals_change_output_without_mutating_inputs_or_caching_response
+    with_micro_theme(block_source: "{% render 'leaf' %}{% schema %}{\"tag\":null}{% endschema %}", snippet: '{{ marker }}:{{ nested.title }}:{{ block.settings.text }};') do |host|
+      globals = { 'marker' => +'first', 'nested' => { 'title' => +'original' } }
+      first = host.render_result(scope: 'hero', globals: globals)
+      globals['marker'].replace('second')
+      globals['nested']['title'].replace('updated')
+      second = host.render_result(scope: 'hero', globals: globals)
+      assert_includes first.html, 'first:original:B;first:original:A;'
+      assert_includes second.html, 'second:updated:B;second:updated:A;'
+      assert_equal 'second', globals['marker']
+      assert_equal 'updated', globals.dig('nested', 'title')
+      assert first.html.frozen?
+      assert first.stylesheets.frozen?
+      assert first.rendered_sources.frozen?
+      refute_same first.request, second.request
+    end
+    caller_fixture = JSON.parse(JSON.generate(@fixture))
+    host = HorizonFixture::Renderer.new(theme_root: @theme, fixture: caller_fixture)
+    caller_fixture.fetch('pages').fetch('index')['title'] = 'Changed after initialization'
+    assert_equal @fixture.dig('pages', 'index', 'title'), host.fixture.dig('pages', 'index', 'title')
+    assert host.fixture.dig('globals', 'shop', 'name').frozen?
+  end
+
+  def test_cached_partial_errors_do_not_leak_into_next_request
+    snippet = "{% if fail %}{{ marker | unknown_fixture_filter }}{% else %}{{ marker }}{% endif %}"
+    with_micro_theme(block_source: "{% render 'leaf' %}{% schema %}{\"tag\":null}{% endschema %}", snippet: snippet) do |host|
+      assert_includes host.render_result(scope: 'hero', globals: { 'marker' => 'good' }).html, 'goodgood'
+      partials = host.send(:partials).dup
+      assert_raises(Liquid::UndefinedFilter) { host.render_result(scope: 'hero', globals: { 'fail' => true }) }
+      assert_empty host.stylesheets
+      assert_empty host.rendered_sources
+      result = host.render_result(scope: 'hero', globals: { 'marker' => 'fresh' })
+      assert_includes result.html, 'freshfresh'
+      assert_equal partials.keys, host.send(:partials).keys
+      partials.each do |key, template|
+        assert_same template.root, host.send(:partials).fetch(key).root
+        assert_empty template.errors
+      end
+    end
+  end
+
+  def test_cooperatively_interleaved_fibers_keep_outputs_and_contexts_isolated
+    block = "{% stylesheet %}.fixture { display: block; }{% endstylesheet %}{% render 'leaf' %}{% schema %}{\"tag\":null}{% endschema %}"
+    with_micro_theme(block_source: block, snippet: '{{ marker }}:{{ block.settings.text }};') do |host|
+      host.render_result(scope: 'hero') # Populate parsed ASTs before interleaving.
+      create_request = host.method(:new_request)
+      host.define_singleton_method(:new_request) do
+        request = create_request.call
+        record = request.method(:record_source)
+        paused = false
+        request.define_singleton_method(:record_source) do |path|
+          record.call(path)
+          if path == 'snippets/leaf.liquid' && !paused
+            paused = true
+            Fiber.yield(instance_variable_get(:@globals).fetch('marker'))
+          end
+        end
+        request
+      end
+      alpha = Fiber.new { host.render_result(scope: 'hero', globals: { 'marker' => 'alpha' }) }
+      beta = Fiber.new { host.render_result(scope: 'hero', globals: { 'marker' => 'beta' }) }
+      assert_equal 'alpha', alpha.resume
+      assert_equal 'beta', beta.resume
+      second = beta.resume
+      first = alpha.resume
+      assert_includes first.html, 'alpha:B;alpha:A;'
+      refute_includes first.html, 'beta'
+      assert_includes second.html, 'beta:B;beta:A;'
+      refute_includes second.html, 'alpha'
+      assert_equal '.fixture { display: block; }', first.css
+      assert_equal first.css, second.css
+      refute_same first.stylesheets, second.stylesheets
+      refute_same first.rendered_sources, second.rendered_sources
+      assert_equal first.rendered_sources, second.rendered_sources
+      first.request.partials.each do |key, template|
+        other = second.request.partials.fetch(key)
+        refute_same template, other
+        assert_same template.root, other.root
+      end
+    end
   end
 
   def test_cli_rejects_internal_output_before_writing_success
@@ -186,6 +282,111 @@ class HorizonFixtureRendererTest < Minitest::Test
       assert_raises(ArgumentError) { runtime.external_output_path!(File.join(directory, 'project', 'never-created-output')) }
       assert_raises(ArgumentError) { runtime.external_output_path!(File.join(@theme, 'never-created-output'), roots: [@theme]) }
       assert_equal File.join(directory, 'safe', 'page'), runtime.external_output_path!(File.join(directory, 'safe', 'page'))
+    end
+  end
+
+  def test_benchmark_worker_preserves_per_sample_hashes_and_timing_contract
+    Dir.mktmpdir('horizon-worker-test') do |output|
+      command = [RbConfig.ruby, File.join(HorizonFixture::PROJECT_ROOT, 'benchmark/worker.rb'), '--liquid-root', ENV.fetch('LIQUID_RUBY_ROOT'), '--theme-root', @theme, '--fixture', File.join(HorizonFixture::PROJECT_ROOT, 'fixtures/store.json'), '--output-dir', output, '--benchmark-mode', 'fiber', '--iterations', '2', '--warmup', '1']
+      stdout, stderr, status = Open3.capture3(*command)
+      assert status.success?, stderr
+      report = JSON.parse(stdout)
+      assert_equal report, JSON.parse(File.read(File.join(output, 'report.json')))
+      assert_equal 'fiber', report.fetch('execution_mode')
+      assert_equal false, report.fetch('response_cache')
+      assert_equal true, report.fetch('correctness_verified')
+      assert_equal 'page', report.fetch('scope')
+      assert_equal 'index', report.fetch('page')
+      assert_operator report.fetch('first_render_ms'), :>, 0
+      assert_operator report.fetch('initialization_ms'), :>, 0
+      assert_equal 2, report.fetch('samples').size
+      assert_equal report.fetch('samples_ms'), report.fetch('samples').map { |sample| sample.fetch('elapsed_ms') }
+      assert_equal report.fetch('samples_allocations'), report.fetch('samples').map { |sample| sample.fetch('allocations') }
+      report.fetch('samples').each do |sample|
+        assert_equal report.fetch('html'), sample.fetch('html')
+        assert_equal report.fetch('css'), sample.fetch('css')
+        assert_operator sample.fetch('cpu_ms'), :>, 0
+        assert_operator sample.fetch('allocations'), :>, 0
+      end
+      assert_equal Digest::SHA256.file(File.join(output, 'index.html')).hexdigest, report.dig('html', 'sha256')
+      assert_equal Digest::SHA256.file(File.join(output, 'styles.css')).hexdigest, report.dig('css', 'sha256')
+      assert_equal 'd97c35b3ba08f026536cb4c469623acb9957af59fb9a9171db012958515fe990', report.dig('html', 'sha256')
+      assert_equal '67a6538e0b763c32ced001728ebf68f375dec497d4fb91c0ee136658ff9f2034', report.dig('css', 'sha256')
+      assert report.fetch('dependencies').fetch('bigdecimal').fetch('version')
+    end
+  end
+
+  def test_worker_rejects_invalid_iteration_count_without_a_success_report
+    Dir.mktmpdir('horizon-worker-invalid') do |output|
+      marker = File.join(output, 'benchmark.json')
+      File.write(marker, 'old-success')
+      File.write(File.join(output, 'report.json'), 'old-success')
+      command = [RbConfig.ruby, File.join(HorizonFixture::PROJECT_ROOT, 'benchmark/worker.rb'), '--liquid-root', ENV.fetch('LIQUID_RUBY_ROOT'), '--theme-root', @theme, '--fixture', File.join(HorizonFixture::PROJECT_ROOT, 'fixtures/store.json'), '--output-dir', output, '--benchmark-json', marker, '--iterations', '0']
+      stdout, stderr, status = Open3.capture3(*command)
+      refute status.success?
+      assert_empty stdout
+      assert_includes stderr, 'iterations and warmup must be positive'
+      refute File.exist?(File.join(output, 'report.json'))
+      refute File.exist?(marker)
+    end
+  end
+
+  def test_output_artifact_symlinks_cannot_overwrite_source_files
+    Dir.mktmpdir('horizon-artifact-target') do |target_directory|
+      protected_file = File.join(target_directory, 'original.txt')
+      File.write(protected_file, 'unchanged')
+      Dir.mktmpdir('horizon-artifact-output') do |output|
+        File.symlink(protected_file, File.join(output, 'index.html'))
+        command = [RbConfig.ruby, File.join(HorizonFixture::PROJECT_ROOT, 'bin/horizon-render'), '--liquid-root', ENV.fetch('LIQUID_RUBY_ROOT'), '--theme-root', @theme, '--fixture', File.join(HorizonFixture::PROJECT_ROOT, 'fixtures/store.json'), '--output-dir', output]
+        stdout, stderr, status = Open3.capture3(*command)
+        refute status.success?
+        assert_empty stdout
+        assert_includes stderr, 'output artifact must not be a symlink'
+        assert_equal 'unchanged', File.read(protected_file)
+        assert File.symlink?(File.join(output, 'index.html'))
+        refute File.exist?(File.join(output, 'report.json'))
+      end
+    end
+  end
+
+  def test_success_marker_symlinks_are_rejected_without_deleting_their_target
+    Dir.mktmpdir('horizon-marker-target') do |directory|
+      target = File.join(directory, 'original.json')
+      link = File.join(directory, 'report.json')
+      File.write(target, 'unchanged')
+      File.symlink(target, link)
+      assert_raises(ArgumentError) { HorizonFixture::Runtime.clear_success_markers!([link]) }
+      assert_equal 'unchanged', File.read(target)
+      assert File.symlink?(link)
+    end
+  end
+
+  def test_clis_preserve_fixture_input_when_an_output_artifact_collides
+    %w[bin/horizon-render benchmark/worker.rb].each do |entry|
+      %w[index.html styles.css report.json].each do |name|
+        Dir.mktmpdir('horizon-input-collision') do |output|
+          input = File.join(output, name)
+          original = '{"original":"fixture bytes"}'
+          File.write(input, original)
+          command = [RbConfig.ruby, File.join(HorizonFixture::PROJECT_ROOT, entry), '--liquid-root', ENV.fetch('LIQUID_RUBY_ROOT'), '--theme-root', @theme, '--fixture', input, '--output-dir', output]
+          stdout, stderr, status = Open3.capture3(*command)
+          refute status.success?, "#{entry} #{name}"
+          assert_empty stdout
+          assert_includes stderr, 'output artifact must not replace fixture input'
+          assert_equal original, File.read(input)
+        end
+      end
+    end
+    Dir.mktmpdir('horizon-benchmark-input-collision') do |directory|
+      input = File.join(directory, 'store.json')
+      original = '{"original":"fixture bytes"}'
+      File.write(input, original)
+      command = [RbConfig.ruby, File.join(HorizonFixture::PROJECT_ROOT, 'benchmark/worker.rb'), '--liquid-root', ENV.fetch('LIQUID_RUBY_ROOT'), '--theme-root', @theme, '--fixture', input, '--output-dir', File.join(directory, 'output'), '--benchmark-json', input]
+      stdout, stderr, status = Open3.capture3(*command)
+      refute status.success?
+      assert_empty stdout
+      assert_includes stderr, 'output artifact must not replace fixture input'
+      assert_equal original, File.read(input)
     end
   end
 

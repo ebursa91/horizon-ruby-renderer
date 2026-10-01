@@ -2,6 +2,9 @@
 
 require 'open3'
 require 'pathname'
+require 'digest'
+require 'tempfile'
+require 'fileutils'
 
 module HorizonFixture
   LIQUID_SHA = '4e39ae4cc3da73921923c0669e0fc84a66b2f696'
@@ -55,6 +58,68 @@ module HorizonFixture
       when 'fiber' then Fiber.new { yield }.resume
       else raise ArgumentError, "unsupported execution mode #{mode.inspect}"
       end
+    end
+
+    def artifact_path!(path, roots: [])
+      raise ArgumentError, "output artifact must not be a symlink: #{path}" if File.symlink?(path)
+      if File.exist?(path) && !File.file?(path)
+        raise ArgumentError, "output artifact must be a regular file: #{path}"
+      end
+      external_output_path!(path, roots: roots)
+    end
+
+    def clear_success_markers!(paths, roots: [])
+      paths.each { |path| artifact_path!(path, roots: roots) }
+      paths.each { |path| File.unlink(path) if File.exist?(path) }
+    end
+
+    def reject_input_collisions!(input, output_paths, roots: [])
+      source_path = File.exist?(input) ? File.realpath(input) : File.expand_path(input)
+      output_paths.each do |path|
+        if artifact_path!(path, roots: roots) == source_path
+          raise ArgumentError, "output artifact must not replace fixture input: #{path}"
+        end
+      end
+    end
+
+    # Replace an artifact atomically; writing never follows an existing file symlink.
+    def write_artifact!(path, content, roots: [])
+      resolved = artifact_path!(path, roots: roots)
+      FileUtils.mkdir_p(File.dirname(resolved))
+      Tempfile.create(['.horizon-output-', '.tmp'], File.dirname(resolved)) do |temporary|
+        temporary.write(content)
+        temporary.close
+        artifact_path!(resolved, roots: roots)
+        File.rename(temporary.path, resolved)
+      end
+    end
+
+    def metadata
+      dependencies = %w[bigdecimal strscan prism json].each_with_object({}) do |name, result|
+        spec = Gem.loaded_specs[name]
+        feature = $LOADED_FEATURES.find { |path| File.basename(path).match?(/\A#{Regexp.escape(name)}\.(?:rb|so|bundle)\z/) }
+        next unless spec || feature
+        version = spec&.version&.to_s
+        version ||= case name
+        when 'bigdecimal' then BigDecimal::VERSION if defined?(BigDecimal::VERSION)
+        when 'strscan' then StringScanner::Version if defined?(StringScanner::Version)
+        when 'prism' then Prism::VERSION if defined?(Prism::VERSION)
+        when 'json' then JSON::VERSION if defined?(JSON::VERSION)
+        end
+        result[name] = { 'version' => version, 'path' => spec&.full_gem_path || feature }
+      end
+      {
+        'ruby_version' => RUBY_VERSION, 'ruby_description' => RUBY_DESCRIPTION,
+        'yjit_enabled' => defined?(RubyVM::YJIT) ? RubyVM::YJIT.enabled? : false,
+        'dependencies' => dependencies
+      }
+    end
+
+    def output_digest(result)
+      {
+        'html' => { 'bytes' => result.html.bytesize, 'sha256' => Digest::SHA256.hexdigest(result.html) },
+        'css' => { 'bytes' => result.css.bytesize, 'sha256' => Digest::SHA256.hexdigest(result.css) }
+      }
     end
   end
 end
