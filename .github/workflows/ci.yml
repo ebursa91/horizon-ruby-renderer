@@ -25,7 +25,7 @@ jobs:
       - name: Fixture integrity
         run: python3 script/validate_fixture.py
       - name: Renderer contracts
-        run: bundle exec ruby test/renderer_test.rb
+        run: bundle exec ruby -Itest -e 'Dir["test/*_test.rb"].sort.each { |path| require_relative path }'
       - name: Original pinned homepage
         run: |
           bundle exec ruby bin/horizon-render --liquid-root "$LIQUID_RUBY_ROOT" --theme-root "$HORIZON_THEME_ROOT" --fixture fixtures/store.json --output-dir "$RUNNER_TEMP/rendered-page"
