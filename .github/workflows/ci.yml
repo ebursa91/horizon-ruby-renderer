@@ -1,0 +1,32 @@
+name: CI
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        ruby: ['4.0.7', '3.4.11']
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby }}
+          bundler-cache: true
+      - name: Checkout external pinned references
+        run: |
+          git clone --quiet https://github.com/Shopify/liquid.git "$RUNNER_TEMP/liquid"
+          git -C "$RUNNER_TEMP/liquid" checkout --quiet 4e39ae4cc3da73921923c0669e0fc84a66b2f696
+          git clone --quiet https://github.com/Shopify/horizon.git "$RUNNER_TEMP/horizon"
+          git -C "$RUNNER_TEMP/horizon" checkout --quiet 5acd1b6b66c02f61d3216e3adace5dd9e0404fc9
+          echo "LIQUID_RUBY_ROOT=$RUNNER_TEMP/liquid" >> "$GITHUB_ENV"
+          echo "HORIZON_THEME_ROOT=$RUNNER_TEMP/horizon" >> "$GITHUB_ENV"
+      - name: Fixture integrity
+        run: python3 script/validate_fixture.py
+      - name: Renderer contracts
+        run: bundle exec ruby test/renderer_test.rb
+      - name: Original pinned homepage
+        run: |
+          bundle exec ruby bin/horizon-render --liquid-root "$LIQUID_RUBY_ROOT" --theme-root "$HORIZON_THEME_ROOT" --fixture fixtures/store.json --output-dir "$RUNNER_TEMP/rendered-page"
+          ruby script/check_output.rb "$RUNNER_TEMP/rendered-page"

@@ -1,0 +1,10 @@
+.bundle/
+vendor/
+.external/
+tmp/
+coverage/
+*.gem
+.deps/
+*.html
+*.css
+*.liquid
