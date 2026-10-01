@@ -105,6 +105,12 @@ module HorizonFixture
     def to_json(*) = JSON.generate('x' => x, 'y' => y)
   end
 
+  # A Shopify-shaped option value has both a display name and object properties.
+  class OptionValue < Hash
+    def to_s = fetch('name')
+    def size = fetch('name').size
+  end
+
   class Palette < Liquid::Drop
     include Enumerable
     def initialize(colors)
@@ -198,6 +204,15 @@ module HorizonFixture
     end
   end
 
+  class JavascriptTag < Liquid::Raw
+    def render_to_output_buffer(context, output)
+      if context.registers[:horizon].collect_javascript(context.template_name)
+        output << '<script data-shopify>' << @body << '</script>'
+      end
+      output
+    end
+  end
+
   class StyleTag < Liquid::Block
     def render_to_output_buffer(context, output)
       output << '<style data-shopify>'
@@ -260,8 +275,36 @@ module HorizonFixture
     def render_to_output_buffer(context, output)
       collection = context.evaluate(@collection)
       size = context.evaluate(@size).to_i
-      raise ContractError, 'fixture pagination supports first page only, positive size required' unless size.positive?
-      context.stack('paginate' => { 'current_page' => 1, 'pages' => [(collection.size.to_f / size).ceil, 1].max, 'items' => collection.size, 'page_size' => size, 'current_offset' => 0 }) do
+      raise ContractError, 'fixture pagination requires an array and a positive size' unless collection.is_a?(Array) && size.positive?
+      pages = [(collection.size.to_f / size).ceil, 1].max
+      selected_page = context['current_page']
+      page = selected_page.nil? ? 1 : selected_page
+      raise ContractError, 'fixture pagination page must be an integer in range' unless page.is_a?(Integer) && (1..pages).cover?(page)
+      offset = (page - 1) * size
+      raise ContractError, 'fixture pagination requires a variable path' unless @collection.is_a?(Liquid::VariableLookup)
+      root_name = context.evaluate(@collection.name)
+      keys = @collection.lookups.map { |key| context.evaluate(key) }
+      root = context[root_name]
+      if keys.empty?
+        sliced_root = collection.slice(offset, size) || []
+      else
+        raise ContractError, 'fixture pagination supports hash property paths only' unless keys.all? { |key| key.is_a?(String) }
+        sliced_root = root.dup
+        source, target = root, sliced_root
+        keys[0...-1].each do |key|
+          source = source.fetch(key)
+          raise ContractError, 'fixture pagination supports hash property paths only' unless source.is_a?(Hash)
+          target[key] = source.dup
+          target = target.fetch(key)
+        end
+        target[keys.last] = collection.slice(offset, size) || []
+      end
+      path = context['request']&.fetch('path', '/') || '/'
+      metadata = { 'current_page' => page, 'pages' => pages, 'items' => collection.size, 'page_size' => size, 'current_offset' => offset,
+                   'previous' => page > 1 ? { 'title' => 'Previous', 'url' => "#{path}?page=#{page - 1}" } : nil,
+                   'next' => page < pages ? { 'title' => 'Next', 'url' => "#{path}?page=#{page + 1}" } : nil,
+                   'parts' => (1..pages).map { |number| { 'title' => number.to_s, 'is_link' => number != page, 'url' => number == page ? nil : "#{path}?page=#{number}" } } }
+      context.stack(root_name => sliced_root, 'paginate' => metadata) do
         super
       end
     end
@@ -338,9 +381,21 @@ module HorizonFixture
       "#{host.money(value)} USD"
     end
 
+    def money_without_currency(value)
+      host.record_filter('money_without_currency')
+      host.money(value).delete('$')
+    end
+
     def json(value)
       host.record_filter('json')
-      JSON.generate(value)
+      JSON.generate(host.json_value(value))
+    end
+
+    def handleize(value)
+      host.record_filter('handleize')
+      text = value.to_s
+      raise ContractError, 'fixture handleize supports ASCII identifiers only' unless /\A[A-Za-z0-9 _-]*\z/.match?(text)
+      text.downcase.tr('_', '-').gsub(/[ -]+/, '-').sub(/\A-/, '').sub(/-\z/, '')
     end
 
     def inline_asset_content(name)
@@ -356,8 +411,10 @@ module HorizonFixture
 
     def standard_event_data(resource, event, options = {})
       host.record_filter('standard_event_data')
-      raise ContractError, 'fixture supports view product/cart events only' unless resource.is_a?(Hash) && event == 'view'
-      payload = if resource.key?('id')
+      raise ContractError, 'fixture supports view product/collection/cart events only' unless resource.is_a?(Hash) && event == 'view'
+      payload = if resource.key?('products') && resource.key?('products_count') && resource.key?('id')
+        { 'event' => event, 'collection_id' => resource.fetch('id'), 'context' => options['context'] }
+      elsif resource.key?('id')
         { 'event' => event, 'product_id' => resource.fetch('id'), 'context' => options['context'] }
       elsif resource.key?('items') && resource.key?('total_price')
         { 'event' => event, 'cart_item_count' => resource.fetch('item_count'), 'cart_total_price' => resource.fetch('total_price'), 'context' => options['context'] }
@@ -429,10 +486,23 @@ module HorizonFixture
 
     def payment_terms(form)
       host.record_filter('payment_terms')
-      unless form.is_a?(Hash) && form['type'] == 'cart' && host.fixture.dig('manifest', 'platform_capabilities', 'payment_terms') == false
-        raise ContractError, 'fixture payment_terms requires explicitly disabled cart financing'
+      unless form.is_a?(Hash) && %w[cart product].include?(form['type']) && host.fixture.dig('manifest', 'platform_capabilities', 'payment_terms') == false
+        raise ContractError, 'fixture payment_terms requires explicitly disabled product/cart financing'
       end
       ''
+    end
+
+    def payment_button(form)
+      host.record_filter('payment_button')
+      unless form.is_a?(Hash) && form['type'] == 'product' && host.fixture.dig('manifest', 'platform_capabilities', 'payment_button') == false
+        raise ContractError, 'fixture payment_button requires explicitly disabled accelerated checkout'
+      end
+      ''
+    end
+
+    def structured_data(product)
+      host.record_filter('structured_data')
+      host.structured_data(product)
     end
 
     def color_brightness(value)
@@ -508,8 +578,14 @@ module HorizonFixture
       @globals = typed_globals(fixture.fetch('globals').merge(globals))
       @globals.dig('cart', 'items')&.each_with_index { |item, index| item['index'] = index }
       page_data = fixture.fetch('pages').fetch(page)
-      @globals.merge!('page_title' => page_data.fetch('title'), 'page_description' => page_data.fetch('description'), 'canonical_url' => @globals.fetch('canonical_url', page_data.fetch('url')), 'current_page' => @globals.fetch('current_page', 1), 'current_tags' => @globals.fetch('current_tags', []))
-      @globals['template'] = TemplateName.new(page)
+      @page, @page_type = page, page_data.fetch('type', page)
+      @page_overrides = fixture.dig('theme', 'page_overrides', page) || {}
+      @globals.merge!('page_title' => page_data.fetch('title'), 'page_description' => page_data.fetch('description'), 'canonical_url' => page_data.fetch('canonical_url', @globals.fetch('canonical_url', page_data.fetch('url'))), 'current_page' => page_data.fetch('current_page', @globals.fetch('current_page', 1)), 'current_tags' => @globals.fetch('current_tags', []))
+      @globals['template'] = TemplateName.new(@page_type)
+      if page_data.key?('type')
+        @globals.fetch('request').merge!('page_type' => @page_type, 'path' => page_data.fetch('url'))
+      end
+      @globals['closest'] = page_resource(page_data)
       @globals['settings'] = global_settings
       template_data = @source.json(page_data.fetch('template'))
       ids = scope == 'hero' ? template_data.fetch('order').first(1) : template_data.fetch('order')
@@ -567,6 +643,12 @@ module HorizonFixture
       @stylesheets[name] ||= body
     end
 
+    def collect_javascript(name)
+      return false if @javascript_sources.include?(name)
+      @javascript_sources << name
+      true
+    end
+
     def record_source(path)
       @rendered_sources << path unless @rendered_sources.include?(path)
     end
@@ -576,8 +658,10 @@ module HorizonFixture
     end
 
     def translate(key, options)
-      text = key.split('.').reduce(@source.json('locales/en.default.json')) { |value, part| value.fetch(part) }
-      text = text.fetch(options['count'] == 1 ? 'one' : 'other') if text.is_a?(Hash) && options.key?('count')
+      locale = @globals.dig('request', 'locale', 'iso_code') || 'en'
+      path = { 'en' => 'en.default', 'de' => 'de', 'pl' => 'pl' }.fetch(locale) { raise ContractError, "unsupported fixture locale #{locale}" }
+      text = key.split('.').reduce(@source.json("locales/#{path}.json")) { |value, part| value.fetch(part) }
+      text = text.fetch(plural_category(locale, options['count'])) if text.is_a?(Hash) && options.key?('count')
       raise ContractError, "fixture translation #{key} requires scalar text" unless text.is_a?(String)
       text.gsub(/{{\s*(\w+)\s*}}/) { |placeholder| options.fetch(Regexp.last_match(1), placeholder).to_s }
     rescue KeyError => error
@@ -600,13 +684,41 @@ module HorizonFixture
 
     def manifest
       { 'synthetic' => true, 'parser_mode' => 'strict', 'render' => 'render!', 'strict_variables' => false, 'strict_filters' => true, 'theme_sha' => fixture.dig('theme', 'sha'), 'liquid_version' => Liquid::VERSION, 'sources' => rendered_sources, 'platform_filters' => platform_filters, 'stylesheets' => stylesheets.keys,
-        'platform_contract' => { 'pagination' => 'first page only', 'font' => 'configured Inter uses local system Arial', 'events' => 'synthetic product/cart view JSON', 'form_submission' => 'unsupported', 'cart_item_index' => 'derived zero-based index', 'payment_terms' => 'empty only when fixture explicitly disables service', 'optional_variables' => 'missing optional properties resolve to nil', 'clock' => fixture.dig('manifest', 'created_at') } }
+        'page' => @page, 'page_type' => @page_type, 'request_id' => fixture.dig('pages', @page, 'request_id'), 'locale' => @globals&.dig('request', 'locale', 'iso_code'),
+        'platform_contract' => { 'pagination' => 'selected page with scoped product slice and total counts', 'font' => 'configured Inter uses local system Arial', 'events' => 'synthetic product/collection/cart view JSON', 'javascript' => 'raw inline script once per source; bundling unsupported', 'structured_data' => 'synthetic Schema.org ProductGroup; not hosted Shopify byte output', 'form_submission' => 'unsupported', 'cart_item_index' => 'derived zero-based index', 'payment_terms' => 'empty only when fixture explicitly disables service', 'payment_button' => 'empty only when fixture explicitly disables service', 'optional_variables' => 'missing optional properties resolve to nil', 'clock' => fixture.dig('manifest', 'created_at') } }
+    end
+
+    def json_value(value)
+      return value unless fixture.dig('manifest', 'mock_contract', 'json_object_order') == 'sorted'
+      case value
+      when Hash then value.keys.sort.to_h { |key| [key, json_value(value.fetch(key))] }
+      when Array then value.map { |item| json_value(item) }
+      when FocalPoint then { 'x' => value.x, 'y' => value.y }
+      else value
+      end
+    end
+
+    def structured_data(product)
+      unless fixture.dig('manifest', 'mock_contract', 'structured_data') == 'synthetic Schema.org ProductGroup' && product.is_a?(Hash) && product['variants'].is_a?(Array)
+        raise ContractError, 'fixture structured_data requires the declared synthetic product contract'
+      end
+      raise ContractError, 'fixture structured_data supports USD only' unless @globals.dig('shop', 'currency') == 'USD'
+      origin, canonical = @globals.fetch('shop').fetch('url'), @globals.fetch('canonical_url')
+      variants = product.fetch('variants').map do |variant|
+        cents = Integer(variant.fetch('price'))
+        { '@type' => 'Product', 'name' => "#{product.fetch('title')} - #{variant.fetch('title')}", 'sku' => variant.fetch('sku'), 'url' => "#{origin}#{variant.fetch('url')}",
+          'offers' => { '@type' => 'Offer', 'priceCurrency' => 'USD', 'price' => format('%d.%02d', cents / 100, cents % 100), 'availability' => "https://schema.org/#{variant.fetch('available') ? 'InStock' : 'OutOfStock'}" } }
+      end
+      JSON.generate('@context' => 'https://schema.org', '@type' => 'ProductGroup', '@id' => "#{canonical}#product", 'name' => product.fetch('title'),
+                    'description' => product.fetch('description').gsub(/<[^>]*>/, ''), 'url' => canonical, 'image' => product.fetch('images').map { |image| "#{origin}#{image.fetch('src')}" },
+                    'brand' => { '@type' => 'Brand', 'name' => product.fetch('vendor') }, 'productGroupID' => product.fetch('id').to_s, 'hasVariant' => variants)
     end
 
     private
 
     def reset
       @stylesheets, @platform_filters, @rendered_sources = {}, [], []
+      @javascript_sources = []
     end
 
     def deep_copy(value) = JSONTree.copy(value)
@@ -615,8 +727,13 @@ module HorizonFixture
       case value
       when Array then value.map { |item| typed_globals(item) }
       when Hash
-        value.to_h do |key, item|
+        result = value.to_h do |key, item|
           [key, key == 'focal_point' && item.is_a?(Hash) ? FocalPoint.new(item) : typed_globals(item)]
+        end
+        if fixture.dig('manifest', 'mock_contract', 'json_object_order') == 'sorted' && %w[id name selected available variant product_url].all? { |key| result.key?(key) }
+          OptionValue.new.replace(result)
+        else
+          result
         end
       when String then value.dup
       else value
@@ -655,8 +772,8 @@ module HorizonFixture
         when 'color' then Color.new(values[id])
         when 'color_palette' then Palette.new(values[id])
         when 'font_picker' then Font.new(values[id])
-        when 'collection' then globals.fetch('collections', {})[values[id]]
-        when 'product' then globals.fetch('all_products', {})[values[id]]
+        when 'collection' then values[id].is_a?(Hash) ? values[id] : globals.fetch('collections', {})[values[id]]
+        when 'product' then values[id].is_a?(Hash) ? values[id] : globals.fetch('all_products', {})[values[id]]
         when 'link_list' then globals.fetch('linklists', {})[values[id]]
         when 'url' then values[id].to_s.sub('shopify://', '/')
         else values[id]
@@ -677,7 +794,7 @@ module HorizonFixture
 
     def render_section(id, raw_node, index)
       node = deep_copy(raw_node)
-      node['settings'] = node.fetch('settings', {}).merge(fixture.dig('theme', 'section_overrides', id, 'settings') || {})
+      node['settings'] = node.fetch('settings', {}).merge(fixture.dig('theme', 'section_overrides', id, 'settings') || {}).merge(@page_overrides.dig('section_overrides', id, 'settings') || {})
       path = "sections/#{node.fetch('type')}.liquid"
       schema = @source.schema(path)
       node['id'], node['index'] = id, index
@@ -686,7 +803,8 @@ module HorizonFixture
       node['blocks'] = BlockCollection.new(node['blocks'], node['block_order'])
       definitions = schema.fetch('settings', [])
       node['settings'] = materialize_settings(setting_defaults(definitions).merge(node['settings']), definitions, @globals)
-      closest = node['settings'].key?('collection') ? { 'collection' => node['settings']['collection'] } : {}
+      closest = @globals.fetch('closest', {}).dup
+      closest['collection'] = node['settings']['collection'] if node['settings'].key?('collection')
       body = render_path(path, @globals.merge('section' => node, 'block' => nil, 'closest' => closest))
       wrap(schema.fetch('tag', 'div'), "shopify-section-#{id}", ['shopify-section', schema['class']].compact.join(' '), body)
     end
@@ -695,7 +813,7 @@ module HorizonFixture
       node = deep_copy(raw_node)
       path = "blocks/#{node.fetch('type')}.liquid"
       schema = @source.schema(path)
-      node['settings'] = node.fetch('settings', {}).merge(fixture.dig('theme', 'block_overrides', id, 'settings') || {})
+      node['settings'] = node.fetch('settings', {}).merge(fixture.dig('theme', 'block_overrides', id, 'settings') || {}).merge(@page_overrides.dig('block_overrides', id, 'settings') || {})
       node['id'], node['shopify_attributes'] = id, ''
       node['blocks'] ||= {}
       node['block_order'] ||= []
@@ -704,6 +822,51 @@ module HorizonFixture
       node['settings'] = materialize_settings(setting_defaults(definitions).merge(node['settings']), definitions, globals.merge('closest' => closest))
       body = render_path(path, globals.merge('block' => node, 'closest' => closest), locals, parent: parent)
       wrap(schema.fetch('tag', 'div'), "shopify-block-#{id}", ['shopify-block', schema['class']].compact.join(' '), body)
+    end
+
+    def page_resource(page_data)
+      resource = page_data['resource']
+      return {} unless resource
+      raise ContractError, 'page resource type must match page type' unless resource.fetch('type') == @page_type
+      case resource.fetch('type')
+      when 'collection'
+        collection = @globals.fetch('collections').fetch(resource.fetch('handle'))
+        @globals['collection'] = collection
+        { 'collection' => collection }
+      when 'product'
+        product = @globals.fetch('all_products').fetch(resource.fetch('handle'))
+        selected_id = resource['variant_id']
+        selected = selected_id ? product.fetch('variants').find { |variant| variant.fetch('id') == selected_id } : nil
+        raise ContractError, 'page selected variant does not belong to product' if selected_id && !selected
+        product.fetch('variants').each { |variant| variant['selected'] = variant.equal?(selected) }
+        product['selected_variant'] = selected
+        product['selected_or_first_available_variant'] = selected || product.fetch('first_available_variant') || product.fetch('variants').first
+        product.fetch('options_with_values').each do |option|
+          position = option.fetch('position') - 1
+          chosen = product.fetch('selected_or_first_available_variant').fetch('options').fetch(position)
+          option['selected_value'] = chosen
+          option.fetch('values').each do |value|
+            value['selected'] = value.fetch('name') == chosen
+            matching = product.fetch('variants').select { |variant| variant.fetch('options').fetch(position) == value.fetch('name') }
+            same_other_options = matching.find { |variant| variant.fetch('options').each_with_index.all? { |name, index| index == position || name == product.fetch('selected_or_first_available_variant').fetch('options').fetch(index) } }
+            value['variant'] = same_other_options || matching.find { |variant| variant.fetch('available') } || matching.first
+          end
+        end
+        product['options_by_name'] = product.fetch('options_with_values').to_h { |option| [option.fetch('name').downcase, option] }
+        @globals['product'] = product
+        { 'product' => product }
+      else raise ContractError, "unsupported page resource #{resource.fetch('type')}"
+      end
+    end
+
+    def plural_category(locale, count)
+      raise ContractError, 'fixture plural count must be a nonnegative number' unless count.is_a?(Numeric) && count.finite? && count >= 0
+      integer = count.is_a?(Integer)
+      return integer && count == 1 ? 'one' : 'other' unless locale == 'pl'
+      return 'other' unless integer
+      return 'one' if count == 1
+      return 'few' if (2..4).cover?(count % 10) && !(12..14).cover?(count % 100)
+      'many'
     end
 
     def wrap(tag, id, css_class, body)
@@ -741,6 +904,7 @@ module HorizonFixture
         env.register_filter(Filters)
         env.register_tag('schema', SchemaTag)
         env.register_tag('stylesheet', StylesheetTag)
+        env.register_tag('javascript', JavascriptTag)
         env.register_tag('style', StyleTag)
         env.register_tag('content_for', ContentForTag)
         env.register_tag('sections', SectionsTag)

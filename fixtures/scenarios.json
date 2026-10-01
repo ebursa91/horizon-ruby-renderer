@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "base_fixture": "store.json",
+  "base_fixture_sha256": "867c41e0929881290af2b261af64146632bf0287524f5a6c55714af32e819f98",
+  "sizes": [4, 100],
+  "locales": ["en", "de", "pl"],
+  "configurations": ["default", "wide"],
+  "pages": ["index", "product", "collection"],
+  "large_store_pages": ["collection_page_2", "collection_last"],
+  "request_id": "unsigned integer from first 15 SHA256 hex digits of scenario_id:page",
+  "cart": {
+    "default": {"quantities": [2, 1], "item_count": 3, "total_price": 13100},
+    "wide": {"quantities": [3, 2], "item_count": 5, "total_price": 24400}
+  },
+  "settings": {
+    "default": {"page_width": "narrow", "variant_style": "buttons", "products_per_page": 24, "product_grid_width": "centered"},
+    "wide": {"page_width": "wide", "variant_style": "dropdowns", "products_per_page": 12, "product_grid_width": "full-width"}
+  },
+  "platform_capabilities": {"payment_terms": false, "payment_button": false},
+  "output_policy": "materialized fixtures and rendered theme output stay outside source repositories"
+}
