@@ -47,3 +47,9 @@ bundle exec grpc_tools_ruby_protoc -I proto \
 ```
 
 Tests use real native loopback gRPC for repeated requests, tenant rejection, deadline/unavailability, and genuine pinned-theme CLI rendering. Boundary tests reject mismatched scope/hash/schema/locale/page without inventing a successful response. The private service is also checked separately by both language clients against the same returned context bytes.
+
+## Verified cross-renderer checkpoint
+
+The [numeric native parity matrix](../benchmark/results/2026-10-01-grpc-parity.json) verifies 112 scopes and 236 fresh-process renders: two tenants, 4/100-product stores, en/de/pl, published/wide configurations, genuine index/product/collection, large collection pagination and representative empty carts. All contexts are stable across correlation identifiers, tenant catalog identities remain separate, and every HTML/CSS pair matches exactly. The separate offline matrix verifies 48 page cases and 192 renders with byte-identical regenerated fixtures.
+
+The oracle fetches each context twice before invoking the native clients, warming the immutable service projection cache. Ruby `fetch_ms` starts after channel/stub construction; Rust `fetch_ms` includes connection/client construction and RPC. Both exclude context hashing, JSON/scope validation and rendering. Outer `cli_wall_ms` includes setup, process/dependency startup, fetch/validation/rendering, writes, exit polling, owned-group cleanup and post-exit verification. Fixed Ruby-before-Rust mixed-case execution supports no SDK ranking, render-only latency, inverse-latency RPS or service capacity claim. Prepared offline HTTP results are reported separately.
