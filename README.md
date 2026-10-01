@@ -62,6 +62,8 @@ Reports include per-sample wall time, process CPU time and allocated objects, pe
 
 An allocation profile of the original host found 88 JSON parses and 41 schema parses per warm homepage, plus context-local snippet parsing. Immutable source/JSON/schema and cross-request AST caches remove that repeated preparation; dynamic setting bindings and output still execute on every request. See [the measurement notes](docs/PERFORMANCE.md).
 
+The [2026-10-01 cross-engine results](benchmark/RESULTS.md) compare seven batches against release liquid-rust with identical full-page output. Observed warm medians were **23.75 ms with YJIT**, **24.37 ms with YJIT and Fiber**, **55.42 ms plain Ruby**, and **65.66 ms Rust**. The shared workstation was busy; complete p95/batch ranges, actual revisions, cold startup costs and numeric samples accompany those results. Fibers preserve cooperative request isolation; this serial measurement does not establish concurrent throughput or a fiber speed benefit.
+
 ## Scope and license
 
 This fixture covers one homepage configuration and locale, not a Shopify server. Checkout, form submission, external services and full Drop semantics are unsupported. Payment terms return empty only for the fixture's explicit disabled capability. Liquid and Horizon remain independently licensed external dependencies; review Horizon's license before distributing its sources or generated content. This repository contains original host/fixture code and synthetic SVGs under the MIT license. Host extraction provenance: `ebursa91/liquid-rust` commit `ce6f371439aa556426c469c319f04afec77aad57`.
